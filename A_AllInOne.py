@@ -1,23 +1,18 @@
 
 # A_AllInOne.py
-# Excel 고정 소스(ux_100_dataset.xlsx)를 읽어 A1~A5 탭에서 분석하는 통합 페이지
+# All‑in‑One dashboard that reads a fixed Excel file (ux_100_dataset.xlsx) from repo root.
+# Tabs (A1~A5) run the same analysis pipeline on chosen sheets.
 #
-# 기대 파일: repo 루트에 `ux_100_dataset.xlsx`
-# - 여러 시트를 지원(sheet_name=None). 권장 시트명: A1, A2, A3, A4, A5
-# - 각 탭에서 사용할 시트를 선택할 수 있음
-# - 데이터 스키마: Company (필수), Category (선택), 그 외 수치형=지표
-#
-# 실행
-# $ streamlit run A_AllInOne.py
+# Run:
+#   streamlit run A_AllInOne.py
 
-import io
-import math
 from pathlib import Path
+import io
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Matplotlib: headless-safe import
+# Headless-safe Matplotlib import
 try:
     import matplotlib
     matplotlib.use("Agg")
@@ -28,33 +23,58 @@ except Exception as _e:
     _MPL_OK = False
     _MPL_ERR = _e
 
-st.set_page_config(page_title="A: All-in-One(Excel Source)", layout="wide")
+st.set_page_config(page_title="A: All‑in‑One (Excel Source)", layout="wide")
 
-EXCEL_PATH = Path(__file__).resolve().parent / "ux_100_dataset.xlsx"
+# ---- Environment info (helps debugging on Streamlit Cloud) ----
+with st.sidebar:
+    st.markdown("### Environment")
+    try:
+        import sys
+        st.write("Python", sys.version.split()[0])
+    except Exception:
+        pass
+    try:
+        import streamlit as _st
+        st.write("streamlit", _st.__version__)
+    except Exception:
+        pass
+    try:
+        st.write("pandas", pd.__version__)
+    except Exception:
+        pass
+    try:
+        import numpy as _np
+        st.write("numpy", _np.__version__)
+    except Exception:
+        pass
+    if not _MPL_OK:
+        st.warning(f"Matplotlib import failed: {_MPL_ERR}")
 
-# -------------------------------
-# 공통 유틸
-# -------------------------------
-def detect_numeric_columns(df, exclude_cols):
-    numeric_cols = []
+# ---- Config ----
+EXCEL_FILENAME = "ux_100_dataset.xlsx"
+EXCEL_PATH = Path(__file__).resolve().parent / EXCEL_FILENAME
+
+# ---- Utils ----
+def detect_numeric_columns(df: pd.DataFrame, exclude_cols: list[str]) -> list[str]:
+    cols = []
     for c in df.columns:
         if c in exclude_cols:
             continue
         if pd.api.types.is_numeric_dtype(df[c]):
-            numeric_cols.append(c)
-    return numeric_cols
+            cols.append(c)
+    return cols
 
-def to_0_100_scale(series, assumed_min=1.0, assumed_max=10.0):
+def to_0_100_scale(series: pd.Series, assumed_min: float = 1.0, assumed_max: float = 10.0) -> pd.Series:
     s = series.astype(float)
     return (s - assumed_min) / (assumed_max - assumed_min) * 100.0
 
-def safe_quantile(series, q):
+def safe_quantile(series: pd.Series, q: float) -> float:
     try:
         return float(series.quantile(q))
     except Exception:
-        return float('nan')
+        return float("nan")
 
-def summarize_distribution(values, title_label=""):
+def summarize_distribution(values: pd.Series, title_label: str = "") -> str:
     s = pd.Series(values).dropna()
     if len(s) == 0:
         return "데이터가 부족하여 분포 해설을 생성할 수 없습니다."
@@ -71,13 +91,14 @@ def summarize_distribution(values, title_label=""):
         msg += " 평균과 중앙값이 비슷하여 대체로 대칭적인 분포로 보입니다."
     return msg
 
-def make_radar(ax, metrics, values, baseline, title):
-    angles = np.linspace(0, 2*np.pi, len(metrics), endpoint=False).tolist()
+def make_radar(ax, metrics, values, baseline, title: str):
+    import numpy as _np
+    angles = _np.linspace(0, 2*_np.pi, len(metrics), endpoint=False).tolist()
     angles += angles[:1]
     v = values.tolist() + values.tolist()[:1]
     b = baseline.tolist() + baseline.tolist()[:1]
 
-    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_offset(_np.pi / 2)
     ax.set_theta_direction(-1)
     ax.set_xticks(angles[:-1])
     ax.set_xticklabels(metrics, fontsize=9)
@@ -88,47 +109,48 @@ def make_radar(ax, metrics, values, baseline, title):
 
     ax.plot(angles, v, linewidth=2)
     ax.fill(angles, v, alpha=0.1)
-    ax.plot(angles, b, linewidth=1, linestyle='--')
+    ax.plot(angles, b, linewidth=1, linestyle="--")
     ax.set_title(title, pad=10, fontsize=12)
 
 @st.cache_data(show_spinner=False)
-def load_all_sheets(xlsx_path: Path):
+def load_all_sheets(xlsx_path: Path) -> dict[str, pd.DataFrame]:
     if not xlsx_path.exists():
         raise FileNotFoundError(f"Excel 파일을 찾지 못했습니다: {xlsx_path}")
-    # sheet_name=None → dict[str, DataFrame]
-    return pd.read_excel(xlsx_path, sheet_name=None)
+    # engine openpyxl
+    return pd.read_excel(xlsx_path, sheet_name=None, engine="openpyxl")
 
-def process_single_dataset(slot_name:str, df: pd.DataFrame):
-    # 옵션들
-    st.markdown(f"#### 분석 옵션 – {slot_name}")
-    assumed_min = st.number_input(f"[{slot_name}] 지표 최소값(스케일 가정)", 0.0, 1000.0, 1.0, 0.5, key=f"min_{slot_name}")
-    assumed_max = st.number_input(f"[{slot_name}] 지표 최대값(스케일 가정)", 1.0, 1000.0, 10.0, 0.5, key=f"max_{slot_name}")
-    rescale = st.checkbox(f"[{slot_name}] 0~100 점수로 재스케일", value=True, key=f"rescale_{slot_name}")
+def process_dataset(slot_key: str, df: pd.DataFrame):
+    # Options
+    st.markdown(f"#### 분석 옵션 – {slot_key}")
+    assumed_min = st.number_input(f"[{slot_key}] 지표 최소값(스케일 가정)", 0.0, 1000.0, 1.0, 0.5, key=f"min_{slot_key}")
+    assumed_max = st.number_input(f"[{slot_key}] 지표 최대값(스케일 가정)", 1.0, 1000.0, 10.0, 0.5, key=f"max_{slot_key}")
+    rescale = st.checkbox(f"[{slot_key}] 0~100 점수로 재스케일", value=True, key=f"rescale_{slot_key}")
 
+    # Schema
     if "Company" not in df.columns:
         st.error("필수 컬럼 'Company'가 없습니다.")
         return
     has_category = "Category" in df.columns
-    exclude = ["Company", "Category"]
-    metric_cols = detect_numeric_columns(df, exclude)
+    metric_cols = detect_numeric_columns(df, exclude_cols=["Company", "Category"])
     if len(metric_cols) == 0:
         st.error("수치형 지표 컬럼이 감지되지 않았습니다.")
         return
 
+    # Preview
     st.markdown("##### 데이터 미리보기")
     st.dataframe(df.head(20), use_container_width=True)
 
-    # 가중치
+    # Weights
     st.markdown("##### 지표 가중치 설정")
     st.write("가중치는 합=1로 자동 정규화됩니다.")
     default_weight = 1.0 / len(metric_cols)
     weight_vals = {}
     for mc in metric_cols:
-        weight_vals[mc] = st.number_input(f"[{slot_name}] {mc} 가중치", 0.0, 100.0, float(default_weight), 0.1, key=f"w_{slot_name}_{mc}")
+        weight_vals[mc] = st.number_input(f"[{slot_key}] {mc} 가중치", 0.0, 100.0, float(default_weight), 0.1, key=f"w_{slot_key}_{mc}")
     w_total = sum(weight_vals.values()) if sum(weight_vals.values()) > 0 else 1.0
     weights = {k: v / w_total for k, v in weight_vals.items()}
 
-    # 점수 계산
+    # Scores
     score_df = df.copy()
     for mc in metric_cols:
         if rescale:
@@ -141,6 +163,7 @@ def process_single_dataset(slot_name:str, df: pd.DataFrame):
     for mc in metric_cols:
         score_df["CompositeScore"] += score_df[f"{mc}_scaled"] * weights[mc]
 
+    # Tiers
     s = score_df["CompositeScore"]
     q33, q66 = s.quantile(0.33), s.quantile(0.66)
     def label_tier(v):
@@ -152,15 +175,15 @@ def process_single_dataset(slot_name:str, df: pd.DataFrame):
             return "Low"
     score_df["Tier"] = score_df["CompositeScore"].apply(label_tier)
 
-    # 결과 테이블 + 다운로드
+    # Table + Download
     show_cols = ["Company"] + (["Category"] if has_category else []) + metric_cols + scaled_cols + ["CompositeScore", "Tier"]
     st.markdown("##### 결과 테이블")
     st.dataframe(score_df[show_cols].sort_values("CompositeScore", ascending=False), use_container_width=True)
     csv_buf = io.StringIO()
     score_df[show_cols].to_csv(csv_buf, index=False, encoding="utf-8-sig")
-    st.download_button(f"[{slot_name}] 결과 CSV 다운로드", data=csv_buf.getvalue(), file_name=f"{slot_name}_results.csv", mime="text/csv")
+    st.download_button(f"[{slot_key}] 결과 CSV 다운로드", data=csv_buf.getvalue(), file_name=f"{slot_key}_results.csv", mime="text/csv")
 
-    # 시각화
+    # Plots
     if not _MPL_OK:
         st.warning(f"Matplotlib 불러오기 실패: {_MPL_ERR}. requirements.txt에 matplotlib를 추가해 주세요.")
         return
@@ -173,7 +196,7 @@ def process_single_dataset(slot_name:str, df: pd.DataFrame):
     ax1.set_xlabel("Score (0~100)")
     ax1.set_ylabel("Count")
     st.pyplot(fig1, use_container_width=False)
-    st.caption(summarize_distribution(score_df["CompositeScore"], f"{slot_name} 종합점수"))
+    st.caption(summarize_distribution(score_df["CompositeScore"], f"{slot_key} 종합점수"))
 
     st.markdown("##### 지표별 분포 (최대 6개)")
     max_charts = min(6, len(metric_cols))
@@ -204,12 +227,12 @@ def process_single_dataset(slot_name:str, df: pd.DataFrame):
             cat_msg += f" 현재 중앙값이 가장 높은 카테고리는 **{best_cat}** 입니다."
         st.caption(cat_msg)
 
-    # 레이더 차트
+    # Radar
     st.markdown("##### 레이더 차트 (기업 vs. 기준선)")
-    colL, colR = st.columns([1,2])
+    colL, colR = st.columns([1, 2])
     with colL:
-        selected_company = st.selectbox(f"[{slot_name}] 기업 선택", score_df["Company"].tolist(), key=f"sel_{slot_name}")
-        baseline_mode = st.radio(f"[{slot_name}] 기준선 선택", ["전체 평균", "카테고리 중앙값(있을 경우)", "전체 중앙값"], index=0, key=f"base_{slot_name}")
+        selected_company = st.selectbox(f"[{slot_key}] 기업 선택", score_df["Company"].tolist(), key=f"sel_{slot_key}")
+        baseline_mode = st.radio(f"[{slot_key}] 기준선 선택", ["전체 평균", "카테고리 중앙값(있을 경우)", "전체 중앙값"], index=0, key=f"base_{slot_key}")
 
     with colR:
         sel_row = score_df.loc[score_df["Company"] == selected_company].iloc[0]
@@ -232,22 +255,21 @@ def process_single_dataset(slot_name:str, df: pd.DataFrame):
         axR = plt.subplot(111, polar=True)
         make_radar(axR, metric_cols, values, baseline, f"{selected_company} vs. {baseline_label}")
         st.pyplot(figR, use_container_width=False)
+
         diffs = (values - baseline).sort_values(ascending=False)
         top_strengths = ", ".join([f"{k} (+{v:.1f})" for k, v in diffs.head(3).items()])
         top_weak = ", ".join([f"{k} ({v:.1f})" for k, v in diffs.tail(3).items()])
         st.caption(f"**요약:** 선택 기업은 {baseline_label} 대비 **강점**이 {top_strengths} 이며, **보완 필요** 영역은 {top_weak} 입니다.")
 
-# -------------------------------
-# 레이아웃
-# -------------------------------
-st.title("A 항목 All-in-One (Excel 고정 데이터 소스)")
-st.caption("repo 루트의 ux_100_dataset.xlsx 를 기반으로 A1~A5 탭 분석을 제공합니다.")
+# ---- Layout ----
+st.title("A 항목 All‑in‑One (Excel 고정 데이터 소스)")
+st.caption("리포지토리 루트의 ux_100_dataset.xlsx를 기반으로 A1~A5 탭 분석을 제공합니다.")
 
-# Excel 로드
+# Load Excel
 try:
     sheets = load_all_sheets(EXCEL_PATH)
 except FileNotFoundError as e:
-    st.error(f"{e}\n\n*배포 리포지토리 루트에 ux_100_dataset.xlsx 를 넣어 주세요.*")
+    st.error(f"{e}\n\n*리포지토리 루트에 '{EXCEL_FILENAME}' 파일을 넣어 주세요.*")
     st.stop()
 except Exception as e:
     st.error(f"Excel 로드 중 오류: {e}")
@@ -260,14 +282,21 @@ with st.sidebar:
     st.header("시트 매핑(탭 → 시트)")
     chosen = {}
     for key in ["A1","A2","A3","A4","A5"]:
-        chosen[key] = st.selectbox(f"{key} 탭 시트", sheet_names, index=(sheet_names.index(default_map[key]) if default_map[key] in sheet_names else 0))
+        if sheet_names:
+            idx = sheet_names.index(default_map[key]) if default_map[key] in sheet_names else 0
+            chosen[key] = st.selectbox(f"{key} 탭 시트", sheet_names, index=idx, key=f"map_{key}")
+        else:
+            chosen[key] = None
 
 tabs = st.tabs(["A1", "A2", "A3", "A4", "A5"])
 for tab_key, tab in zip(["A1","A2","A3","A4","A5"], tabs):
     with tab:
-        st.markdown(f"### 탭: {tab_key}  |  시트: **{chosen[tab_key]}**")
-        df_tab = sheets[chosen[tab_key]].copy()
-        process_single_dataset(tab_key, df_tab)
+        if chosen[tab_key] is None:
+            st.warning("선택할 시트가 없습니다.")
+        else:
+            st.markdown(f"### 탭: {tab_key}  |  시트: **{chosen[tab_key]}**")
+            df_tab = sheets[chosen[tab_key]].copy()
+            process_dataset(tab_key, df_tab)
 
 st.markdown("---")
 st.markdown("##### 사용 팁")
