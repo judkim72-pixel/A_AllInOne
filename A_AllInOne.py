@@ -1,25 +1,36 @@
 
 # A_AllInOne.py
-# 하나의 페이지에서 A항목(최대 5개 데이터셋)을 탭 형태로 모두 확인/분석할 수 있는 통합 페이지
+# Excel 고정 소스(ux_100_dataset.xlsx)를 읽어 A1~A5 탭에서 분석하는 통합 페이지
 #
-# 각 탭 공통 기능
-# - CSV 업로드(Company 필수, Category 선택, 나머지 수치형 자동 인식)
-# - 1~10 가정 스케일 → 0~100 재스케일 옵션
-# - 가중치 기반 CompositeScore 계산 및 분위 등급(Tier) 산출
-# - 분포/박스플롯/레이더 차트 + 자동 해설
-# - 결과 CSV 다운로드
+# 기대 파일: repo 루트에 `ux_100_dataset.xlsx`
+# - 여러 시트를 지원(sheet_name=None). 권장 시트명: A1, A2, A3, A4, A5
+# - 각 탭에서 사용할 시트를 선택할 수 있음
+# - 데이터 스키마: Company (필수), Category (선택), 그 외 수치형=지표
 #
-# 사용
+# 실행
 # $ streamlit run A_AllInOne.py
 
 import io
 import math
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="A: All-in-One(5 datasets)", layout="wide")
+# Matplotlib: headless-safe import
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _MPL_OK = True
+    _MPL_ERR = None
+except Exception as _e:
+    _MPL_OK = False
+    _MPL_ERR = _e
+
+st.set_page_config(page_title="A: All-in-One(Excel Source)", layout="wide")
+
+EXCEL_PATH = Path(__file__).resolve().parent / "ux_100_dataset.xlsx"
 
 # -------------------------------
 # 공통 유틸
@@ -80,18 +91,20 @@ def make_radar(ax, metrics, values, baseline, title):
     ax.plot(angles, b, linewidth=1, linestyle='--')
     ax.set_title(title, pad=10, fontsize=12)
 
-def process_single_dataset(slot_name:str):
-    st.markdown(f"### 데이터 업로드 – {slot_name}")
-    uploaded = st.file_uploader(f"{slot_name} CSV 업로드 (필수: Company, 선택: Category)", type=["csv"], key=f"fu_{slot_name}")
+@st.cache_data(show_spinner=False)
+def load_all_sheets(xlsx_path: Path):
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"Excel 파일을 찾지 못했습니다: {xlsx_path}")
+    # sheet_name=None → dict[str, DataFrame]
+    return pd.read_excel(xlsx_path, sheet_name=None)
+
+def process_single_dataset(slot_name:str, df: pd.DataFrame):
+    # 옵션들
+    st.markdown(f"#### 분석 옵션 – {slot_name}")
     assumed_min = st.number_input(f"[{slot_name}] 지표 최소값(스케일 가정)", 0.0, 1000.0, 1.0, 0.5, key=f"min_{slot_name}")
     assumed_max = st.number_input(f"[{slot_name}] 지표 최대값(스케일 가정)", 1.0, 1000.0, 10.0, 0.5, key=f"max_{slot_name}")
     rescale = st.checkbox(f"[{slot_name}] 0~100 점수로 재스케일", value=True, key=f"rescale_{slot_name}")
 
-    if uploaded is None:
-        st.info("CSV를 업로드하면 분석 결과를 볼 수 있습니다.")
-        return
-
-    df = pd.read_csv(uploaded)
     if "Company" not in df.columns:
         st.error("필수 컬럼 'Company'가 없습니다.")
         return
@@ -102,11 +115,11 @@ def process_single_dataset(slot_name:str):
         st.error("수치형 지표 컬럼이 감지되지 않았습니다.")
         return
 
-    st.subheader("데이터 미리보기")
+    st.markdown("##### 데이터 미리보기")
     st.dataframe(df.head(20), use_container_width=True)
 
     # 가중치
-    st.markdown("#### 지표 가중치 설정")
+    st.markdown("##### 지표 가중치 설정")
     st.write("가중치는 합=1로 자동 정규화됩니다.")
     default_weight = 1.0 / len(metric_cols)
     weight_vals = {}
@@ -141,14 +154,19 @@ def process_single_dataset(slot_name:str):
 
     # 결과 테이블 + 다운로드
     show_cols = ["Company"] + (["Category"] if has_category else []) + metric_cols + scaled_cols + ["CompositeScore", "Tier"]
-    st.markdown("#### 결과 테이블")
+    st.markdown("##### 결과 테이블")
     st.dataframe(score_df[show_cols].sort_values("CompositeScore", ascending=False), use_container_width=True)
     csv_buf = io.StringIO()
     score_df[show_cols].to_csv(csv_buf, index=False, encoding="utf-8-sig")
     st.download_button(f"[{slot_name}] 결과 CSV 다운로드", data=csv_buf.getvalue(), file_name=f"{slot_name}_results.csv", mime="text/csv")
 
+    # 시각화
+    if not _MPL_OK:
+        st.warning(f"Matplotlib 불러오기 실패: {_MPL_ERR}. requirements.txt에 matplotlib를 추가해 주세요.")
+        return
+
     st.markdown("---")
-    st.markdown("#### 분포 시각화 & 자동 해설")
+    st.markdown("##### 분포 시각화 & 자동 해설")
     fig1, ax1 = plt.subplots(figsize=(6, 4))
     ax1.hist(score_df["CompositeScore"], bins=12)
     ax1.set_title("Composite Score Distribution")
@@ -157,7 +175,7 @@ def process_single_dataset(slot_name:str):
     st.pyplot(fig1, use_container_width=False)
     st.caption(summarize_distribution(score_df["CompositeScore"], f"{slot_name} 종합점수"))
 
-    st.markdown("#### 지표별 분포 (최대 6개)")
+    st.markdown("##### 지표별 분포 (최대 6개)")
     max_charts = min(6, len(metric_cols))
     grid_cols = st.columns(max_charts)
     for i, mc in enumerate(metric_cols[:max_charts]):
@@ -171,7 +189,7 @@ def process_single_dataset(slot_name:str):
             st.caption(summarize_distribution(score_df[f"{mc}_scaled"], f"{mc}"))
 
     if has_category:
-        st.markdown("#### 카테고리별 박스플롯 & 해설")
+        st.markdown("##### 카테고리별 박스플롯 & 해설")
         fig2, ax2 = plt.subplots(figsize=(7, 4))
         cats = list(score_df["Category"].dropna().unique())
         data_by_cat = [score_df.loc[score_df["Category"] == c, "CompositeScore"].dropna().values for c in cats]
@@ -187,7 +205,7 @@ def process_single_dataset(slot_name:str):
         st.caption(cat_msg)
 
     # 레이더 차트
-    st.markdown("#### 레이더 차트 (기업 vs. 기준선)")
+    st.markdown("##### 레이더 차트 (기업 vs. 기준선)")
     colL, colR = st.columns([1,2])
     with colL:
         selected_company = st.selectbox(f"[{slot_name}] 기업 선택", score_df["Company"].tolist(), key=f"sel_{slot_name}")
@@ -222,19 +240,39 @@ def process_single_dataset(slot_name:str):
 # -------------------------------
 # 레이아웃
 # -------------------------------
-st.title("A 항목 All‑in‑One 대시보드 (최대 5개 데이터셋)")
-st.caption("한 페이지에서 A1~A5(또는 5개 데이터셋)를 탭으로 전환하며 동일한 분석 파이프라인으로 확인합니다.")
+st.title("A 항목 All-in-One (Excel 고정 데이터 소스)")
+st.caption("repo 루트의 ux_100_dataset.xlsx 를 기반으로 A1~A5 탭 분석을 제공합니다.")
+
+# Excel 로드
+try:
+    sheets = load_all_sheets(EXCEL_PATH)
+except FileNotFoundError as e:
+    st.error(f"{e}\n\n*배포 리포지토리 루트에 ux_100_dataset.xlsx 를 넣어 주세요.*")
+    st.stop()
+except Exception as e:
+    st.error(f"Excel 로드 중 오류: {e}")
+    st.stop()
+
+sheet_names = list(sheets.keys())
+default_map = {name: name if name in sheet_names else (sheet_names[0] if sheet_names else None) for name in ["A1","A2","A3","A4","A5"]}
+
+with st.sidebar:
+    st.header("시트 매핑(탭 → 시트)")
+    chosen = {}
+    for key in ["A1","A2","A3","A4","A5"]:
+        chosen[key] = st.selectbox(f"{key} 탭 시트", sheet_names, index=(sheet_names.index(default_map[key]) if default_map[key] in sheet_names else 0))
 
 tabs = st.tabs(["A1", "A2", "A3", "A4", "A5"])
-slot_names = ["A1", "A2", "A3", "A4", "A5"]
-for tab, name in zip(tabs, slot_names):
+for tab_key, tab in zip(["A1","A2","A3","A4","A5"], tabs):
     with tab:
-        process_single_dataset(name)
+        st.markdown(f"### 탭: {tab_key}  |  시트: **{chosen[tab_key]}**")
+        df_tab = sheets[chosen[tab_key]].copy()
+        process_single_dataset(tab_key, df_tab)
 
 st.markdown("---")
 st.markdown("##### 사용 팁")
 st.write("""
-- 각 탭은 완전히 독립적으로 동작합니다. 서로 다른 CSV를 올려 비교하거나 동일 CSV를 여러 탭에 올려 설정(가중치/스케일)을 달리하여 비교할 수 있습니다.
-- 결과 테이블/분포/박스플롯/레이더 차트 하단의 캡션은 자동 해설을 제공합니다.
-- 레이더 차트의 기준선(전체 평균/중앙값, 동일 카테고리 중앙값)을 바꾸며 상대 비교를 빠르게 확인하세요.
+- 각 탭은 선택된 시트를 기준으로 독립적으로 동작합니다.
+- 지표 스케일(1~10 가정 / 0~100 재스케일), 가중치, 기준선 등을 바꿔가며 비교하세요.
+- 필수 컬럼: Company. 선택: Category. 그 외 수치형은 모두 지표로 인식합니다.
 """)
