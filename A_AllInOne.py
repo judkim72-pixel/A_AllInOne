@@ -261,8 +261,9 @@ def process_dataset(slot_key: str, df: pd.DataFrame):
         top_weak = ", ".join([f"{k} ({v:.1f})" for k, v in diffs.tail(3).items()])
         st.caption(f"**요약:** 선택 기업은 {baseline_label} 대비 **강점**이 {top_strengths} 이며, **보완 필요** 영역은 {top_weak} 입니다.")
 
+
 # ---- Layout ----
-st.title("A 항목 All‑in‑One (Excel 고정 데이터 소스)")
+st.title("A 항목 All-in-One (Excel 고정 데이터 소스)")
 st.caption("리포지토리 루트의 ux_100_dataset.xlsx를 기반으로 A1~A5 탭 분석을 제공합니다.")
 
 # Load Excel
@@ -276,32 +277,109 @@ except Exception as e:
     st.stop()
 
 sheet_names = list(sheets.keys())
-default_map = {name: name if name in sheet_names else (sheet_names[0] if sheet_names else None) for name in ["A1","A2","A3","A4","A5"]}
 
+# --- Sidebar: per-tab sheet & column mapping ---
 with st.sidebar:
-    st.header("시트 매핑(탭 → 시트)")
-    chosen = {}
+    st.header("시트 & 컬럼 매핑")
+
+    # Default sheet mapping
+    default_map = {name: name if name in sheet_names else (sheet_names[0] if sheet_names else None) for name in ["A1","A2","A3","A4","A5"]}
+
+    chosen_sheet = {}
+    company_col_map = {}
+    category_col_map = {}
+
+    # Known synonyms
+    company_synonyms = ["Company", "company", "기업명", "기업", "회사", "회사명", "Name", "name"]
+    category_synonyms = ["Category", "category", "카테고리", "분류", "업종", "그룹", "Group", "group", "Sector", "sector"]
+
     for key in ["A1","A2","A3","A4","A5"]:
+        st.markdown(f"**탭 {key}**")
+        # Sheet select
         if sheet_names:
             idx = sheet_names.index(default_map[key]) if default_map[key] in sheet_names else 0
-            chosen[key] = st.selectbox(f"{key} 탭 시트", sheet_names, index=idx, key=f"map_{key}")
+            chosen_sheet[key] = st.selectbox(f"{key} 탭 시트", sheet_names, index=idx, key=f"map_sheet_{key}")
         else:
-            chosen[key] = None
+            chosen_sheet[key] = None
+
+        # Infer candidate columns
+        df_tmp = sheets[chosen_sheet[key]].head(1) if chosen_sheet[key] else None
+        cols = list(df_tmp.columns) if df_tmp is not None else []
+
+        # Company column
+        comp_default = None
+        for cand in company_synonyms:
+            if cand in cols:
+                comp_default = cand
+                break
+        company_col_map[key] = st.selectbox(f"{key} - Company 컬럼", options=cols, index=(cols.index(comp_default) if comp_default in cols else 0) if cols else 0, key=f"map_company_{key}") if cols else None
+
+        # Category column (optional)
+        cat_default = None
+        for cand in category_synonyms:
+            if cand in cols:
+                cat_default = cand
+                break
+        category_col_map[key] = st.selectbox(f"{key} - Category 컬럼(선택)", options=["(없음)"] + cols, index=( (["(없음)"]+cols).index(cat_default) if cat_default in cols else 0), key=f"map_category_{key}") if cols else "(없음)"
+        st.divider()
+
+def coerce_numeric(df, exclude_cols):
+    df_out = df.copy()
+    numeric_cols = []
+    for c in df_out.columns:
+        if c in exclude_cols:
+            continue
+        # try numeric coercion
+        coerced = pd.to_numeric(df_out[c], errors="coerce")
+        # consider numeric if at least one non-null after coercion
+        if coerced.notna().sum() > 0:
+            df_out[c] = coerced
+            numeric_cols.append(c)
+    return df_out, numeric_cols
 
 tabs = st.tabs(["A1", "A2", "A3", "A4", "A5"])
 for tab_key, tab in zip(["A1","A2","A3","A4","A5"], tabs):
     with tab:
-        if chosen[tab_key] is None:
+        if chosen_sheet.get(tab_key) is None:
             st.warning("선택할 시트가 없습니다.")
-        else:
-            st.markdown(f"### 탭: {tab_key}  |  시트: **{chosen[tab_key]}**")
-            df_tab = sheets[chosen[tab_key]].copy()
-            process_dataset(tab_key, df_tab)
+            continue
 
-st.markdown("---")
-st.markdown("##### 사용 팁")
-st.write("""
-- 각 탭은 선택된 시트를 기준으로 독립적으로 동작합니다.
-- 지표 스케일(1~10 가정 / 0~100 재스케일), 가중치, 기준선 등을 바꿔가며 비교하세요.
-- 필수 컬럼: Company. 선택: Category. 그 외 수치형은 모두 지표로 인식합니다.
-""")
+        df_tab_raw = sheets[chosen_sheet[tab_key]].copy()
+
+        if df_tab_raw.empty:
+            st.error("시트에 데이터가 없습니다.")
+            continue
+
+        # Rename columns to canonical names based on mapping
+        comp_col = company_col_map.get(tab_key)
+        cat_col = category_col_map.get(tab_key)
+        if comp_col is None:
+            st.error("Company 컬럼을 선택해 주세요.")
+            continue
+
+        rename_map = {comp_col: "Company"}
+        if cat_col and cat_col != "(없음)":
+            rename_map[cat_col] = "Category"
+        df_tab = df_tab_raw.rename(columns=rename_map)
+
+        if "Company" not in df_tab.columns:
+            st.error("필수 컬럼 'Company'가 없습니다. 사이드바에서 매핑을 확인해 주세요.")
+            continue
+
+        # Coerce numerics & let user choose metric columns
+        df_coerced, numeric_candidates = coerce_numeric(df_tab, exclude_cols=["Company", "Category"])
+        st.markdown("#### 지표 컬럼 선택")
+        if len(numeric_candidates) == 0:
+            st.error("수치형으로 판별되는 지표 컬럼이 없습니다. 엑셀 데이터 타입을 확인해 주세요.")
+            continue
+        selected_metrics = st.multiselect("분석에 사용할 지표 컬럼", options=numeric_candidates, default=numeric_candidates, key=f"metric_sel_{tab_key}")
+        if len(selected_metrics) == 0:
+            st.warning("선택된 지표가 없습니다. 최소 1개 이상 선택해 주세요.")
+            continue
+
+        # Keep only selected metrics + Company/Category
+        keep_cols = ["Company"] + (["Category"] if "Category" in df_coerced.columns else []) + selected_metrics
+        df_ready = df_coerced[keep_cols].copy()
+
+        st.markdown(f"### 탭: {tab_key}  |  시트: **{chosen_sheet[tab_key]}**")
+        process_dataset(tab_key, df_ready)
